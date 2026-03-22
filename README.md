@@ -1,6 +1,6 @@
 # NM i AI 2026 — Task 3
 
-3x YOLOv11x ensemble with WBF and horizontal flip TTA. Score: **0.9174**.
+3x YOLOv11x ensemble with WBF and horizontal flip TTA. Score: **0.9177**.
 
 ## Approach
 
