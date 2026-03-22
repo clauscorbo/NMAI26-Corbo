@@ -1,91 +1,63 @@
-# NM i AI 2026 — Task 3: Grocery Shelf Product Detection
+# NM i AI 2026 — Task 3: NorgesGruppen Shelf Detection
 
-## Final Score
+Score: **0.9174** on the public leaderboard. Final submission tweaks the WBF IoU from 0.65 → 0.60, same models otherwise.
 
-**0.9174** public leaderboard (v4 baseline with WBF IoU 0.65).  
-Final submission: v5 variant with WBF IoU 0.60 (same models, minor WBF tuning).
+## What we did
 
-## Approach
+We ensemble three YOLOv11x models and merge their predictions with Weighted Box Fusion (WBF). Each model also does a horizontal flip pass (TTA), so there are 6 detection lists per image going into WBF.
 
-**3× YOLOv11x ensemble** with Weighted Box Fusion (WBF) and horizontal flip TTA.
+| Model | Res | Data | Val mAP |
+|-------|-----|------|---------|
+| YOLOv11x | 1280 | 90/10 split | 0.757 |
+| YOLOv11x | 1600 | 90/10 split | 0.758 |
+| YOLOv11x | 1280 | Oversampled (sqrt repeat-factor) | 0.757 |
 
-| Model | Resolution | Training Data | Val mAP@0.5 |
-|-------|-----------|---------------|-------------|
-| YOLOv11x | 1280px | Standard 90/10 split | 0.757 |
-| YOLOv11x | 1600px | Standard 90/10 split | 0.758 |
-| YOLOv11x | 1280px | Class-balanced (sqrt oversampling) | 0.757 |
+All exported to ONNX FP16 (~101 MB each → fits 3 under the 420 MB limit).
 
-All models exported to ONNX FP16 (~101 MB each, 3 models fit under 420 MB limit).
+The inference flow:
+1. Run each model at its training resolution
+2. Flip TTA doubles the detection lists (6 total)
+3. NMS per model (conf > 0.001, IoU 0.5)
+4. WBF merges everything (IoU 0.60)
+5. Keep top 300 detections, write COCO JSON
 
-### Ensemble Pipeline
+We set the confidence threshold very low (0.001) on purpose — WBF handles the scoring, so it's better to feed it more candidates and let fusion suppress the weak ones.
 
-1. Each model runs inference at its native resolution
-2. Horizontal flip TTA doubles detections per model (6 detection lists total)
-3. Per-model NMS filters candidates (conf > 0.001, IoU 0.5, top 900)
-4. `ensemble_boxes` WBF merges all 6 lists (IoU threshold 0.60)
-5. Top 300 detections per image output as COCO JSON
-
-### Key Hyperparameters
-
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| CONF_THRESH | 0.001 | Low to feed more candidates to WBF |
-| IOU_THRESH | 0.5 | Per-model NMS |
-| WBF_IOU_THRESH | 0.60 | WBF merging threshold |
-| MAX_DET | 300 | Final detections per image |
-| ENABLE_TTA | True | Horizontal flip |
-
-## Project Structure
+## Files
 
 ```
-delivery_final/
-├── README.md               # This file
-├── inference/
-│   └── run.py              # Submission inference code (ONNX + WBF + TTA)
-└── training/
-    ├── prepare_data.py      # Stratified train/val split
-    ├── oversample.py        # Class-balanced repeat-factor sampling
-    ├── train.py             # Train 3× YOLOv11x variants
-    ├── export.py            # Export .pt → ONNX FP16
-    └── build_submission.py  # Package ONNX models + run.py into zip
+inference/run.py          — the actual submission script (ONNX + WBF + TTA)
+training/prepare_data.py  — stratified train/val split
+training/oversample.py    — repeat-factor oversampling for rare classes
+training/train.py         — trains the three YOLOv11x variants
+training/export.py        — .pt → ONNX FP16
+training/build_submission.py — zips ONNX models + run.py
 ```
 
-## Reproducing Results
+## How to reproduce
 
-### Requirements
+You need Python 3.10+, a GPU with ~32 GB VRAM, and `pip install ultralytics scikit-learn numpy`.
 
-- Python 3.10+
-- GPU: NVIDIA RTX 5090 32GB (or equivalent, ~32GB VRAM)
-- `pip install ultralytics scikit-learn numpy`
-
-### 1. Data Setup
-
+Put the competition data in:
 ```
-data/train/images/           — shelf images (img_XXXXX.jpg)
-data/train/labels/           — YOLO format labels (img_XXXXX.txt)
-data/train/annotations.json  — COCO annotations
+data/train/images/          (shelf images)
+data/train/labels/          (YOLO-format labels)
+data/train/annotations.json (COCO annotations)
 ```
 
-### 2. Prepare Data
-
+Then:
 ```bash
+# prep
 python training/prepare_data.py --data-dir data
 python training/oversample.py --data-dir data
-```
 
-### 3. Train Models
+# train (each takes a few hours on an RTX 5090)
+python training/train.py --variant standard --device 0
+python training/train.py --variant highres  --device 0
+python training/train.py --variant balanced --device 0
 
-```bash
-python training/train.py --variant standard --device 0   # ~3h on RTX 5090
-python training/train.py --variant highres  --device 0   # ~5h on RTX 5090
-python training/train.py --variant balanced --device 0   # ~3h on RTX 5090
-```
-
-### 4. Export & Build Submission
-
-```bash
+# export and package
 python training/export.py --all --device 0
-
 python training/build_submission.py \
     --models work_dirs/yolo11x_1280/weights/best.onnx \
              work_dirs/yolo11x_1600/weights/best.onnx \
@@ -93,27 +65,26 @@ python training/build_submission.py \
     --output submission.zip
 ```
 
-## Key Design Decisions
+## Why these choices
 
-- **YOLOv11x**: Best accuracy in the YOLO family. Exported to ONNX to bypass sandbox ultralytics version constraint (sandbox has 8.1.0, we trained with 8.4.24).
-- **FP16 ONNX**: Halves model size (~110 MB → ~101 MB each) to fit 3 models under the 420 MB submission limit.
-- **ensemble_boxes WBF**: Pre-installed in sandbox (v1.0.9). Produces better merged boxes than custom WBF (+0.006 on val).
-- **Very low CONF_THRESH (0.001)**: WBF handles scoring — low-confidence candidates get suppressed by the fusion process.
-- **Horizontal flip TTA**: +1.2 mAP in ensemble mode. Cheap at inference time.
-- **Class-balanced oversampling**: Repeat-factor sampling with sqrt scaling for rare categories. Adds diversity to ensemble.
-- **1600px model**: Marginal single-model gain but adds resolution diversity.
-- **No classifier stage**: Tested 2-stage (detector + ResNet50 classifier) but it hurt the score — the 3-YOLO ensemble already outperformed 2-YOLO + classifier.
+**YOLOv11x** — best accuracy we could get from the YOLO family. We trained with ultralytics 8.4.24 but the sandbox only has 8.1.0, so exporting to ONNX sidesteps that entirely.
 
-## Sandbox Compliance
+**FP16 ONNX** — cuts model size roughly in half (~110 → ~101 MB) which is the only way to squeeze 3 models under the weight limit.
 
-Submission `run.py` uses only sandbox-allowed imports:
-- `argparse`, `json`, `pathlib` (stdlib)
-- `cv2`, `numpy`, `onnxruntime` (pre-installed)
-- `ensemble_boxes` (pre-installed v1.0.9)
+**WBF over custom NMS** — `ensemble_boxes` is pre-installed in the sandbox and gave us +0.006 mAP over a hand-rolled WBF.
 
-No banned imports (`os`, `sys`, `subprocess`, etc.).
+**Horizontal flip TTA** — cheap and added ~1.2 mAP in ensemble mode.
+
+**Oversampled third model** — sqrt repeat-factor sampling for rare categories. Doesn't help much on its own but adds diversity to the ensemble.
+
+**1600px model** — barely better as a single model, but the resolution diversity helps the ensemble.
+
+**No second-stage classifier** — we tried detector + ResNet50 classifier but it actually hurt. The 3-YOLO ensemble was already better than 2-YOLO + classifier.
+
+## Sandbox notes
+
+`run.py` only imports stuff that's pre-installed: `cv2`, `numpy`, `onnxruntime`, `ensemble_boxes`, plus stdlib (`argparse`, `json`, `pathlib`). No banned imports.
 
 ## Hardware
 
-- **Training**: NVIDIA RTX 5090 32GB (vast.ai)
-- **Inference**: NVIDIA L4 24GB (competition sandbox, 300s timeout)
+Training: RTX 5090 32 GB (vast.ai). Inference: L4 24 GB (competition sandbox).
